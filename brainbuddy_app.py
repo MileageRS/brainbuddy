@@ -1,4 +1,4 @@
-# brainbuddy_app.py
+# brainbuddy_app.py — local auth + freemium + Stripe (robust session_id parsing)
 import os
 import json
 import time
@@ -9,8 +9,7 @@ from textwrap import dedent
 import requests
 import streamlit as st
 
-
-# Try to import Stripe safely so app never crashes if package isn't installed
+# Try to import Stripe safely so the app never crashes if package isn't installed
 try:
     import stripe
     STRIPE_AVAILABLE = True
@@ -23,11 +22,11 @@ except Exception:
 # =========================
 APP_DIR = os.path.dirname(__file__)
 
-# Freemium usage limits
-USAGE_PATH = os.path.join(APP_DIR, ".usage.json")  # local usage db (MVP)
+# Freemium usage limits (local JSON)
+USAGE_PATH = os.path.join(APP_DIR, ".usage.json")
 FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "5"))
 
-# Local (free) model via Ollama (builder/dev mode)
+# Local (free) model via Ollama (dev only)
 USE_OLLAMA = os.getenv("USE_OLLAMA", "0") == "1"
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:latest")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
@@ -50,31 +49,14 @@ if STRIPE_AVAILABLE and STRIPE_SECRET_KEY:
 st.set_page_config(page_title="🧠 BrainBuddy", page_icon="🧠", layout="centered")
 st.title("🧠 BrainBuddy — Study Copilot")
 st.caption("Free tier with daily limits. Upgrade unlocks unlimited answers + upcoming study tools.")
+st.caption("Mode: Local auth (nickname) — dev/demo only")
 
 # =========================
-# Auth (simple nickname sign-in stored in session)
+# Helpers
 # =========================
 def uhash(name: str) -> str:
     return hashlib.sha256(name.strip().lower().encode("utf-8")).hexdigest()[:16]
 
-if "user" not in st.session_state:
-    st.session_state.user = None
-
-if st.session_state.user is None:
-    st.subheader("Sign in (no email needed)")
-    username = st.text_input("Pick a nickname:", placeholder="e.g., mattj")
-    if st.button("Sign in"):
-        if username.strip():
-            st.session_state.user = {"name": username.strip(), "id": uhash(username)}
-            st.success(f"Signed in as {username.strip()}")
-            st.rerun()
-    st.stop()
-
-USER = st.session_state.user
-
-# =========================
-# Usage tracking (local JSON)
-# =========================
 def load_usage() -> dict:
     if os.path.exists(USAGE_PATH):
         try:
@@ -88,28 +70,35 @@ def save_usage(db: dict):
     with open(USAGE_PATH, "w") as f:
         json.dump(db, f, indent=2)
 
-def today_key() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+def get_query_param(name: str):
+    """Return a single value from Streamlit query params, handling both str and list[str]."""
+    # New API
+    try:
+        qp = st.query_params
+        if hasattr(qp, "get"):
+            val = qp.get(name)
+            if val is None:
+                return None
+            if isinstance(val, list):
+                return val[0] if val else None
+            return val
+    except Exception:
+        pass
+    # Fallback to experimental
+    try:
+        qp = st.experimental_get_query_params()
+        val = qp.get(name)
+        if isinstance(val, list):
+            return val[0] if val else None
+        return val
+    except Exception:
+        return None
 
-def get_count(db: dict, uid: str, day: str) -> int:
-    return db.get(uid, {}).get(day, 0)
-
-def inc_count(db: dict, uid: str, day: str) -> int:
-    db.setdefault(uid, {})
-    db[uid][day] = db[uid].get(day, 0) + 1
-    save_usage(db)
-    return db[uid][day]
-
-db = load_usage()
-today = today_key()
-used_today = get_count(db, USER["id"], today)
-remaining = max(0, FREE_DAILY_LIMIT - used_today)
-
-# Sidebar info
-st.sidebar.subheader("Account")
-st.sidebar.write(f"User: **{USER['name']}**")
-st.sidebar.metric("Free answers left today", remaining)
-st.sidebar.caption(f"Daily reset at midnight • Limit: {FREE_DAILY_LIMIT}")
+def clear_query_params():
+    try:
+        st.experimental_set_query_params()
+    except Exception:
+        pass
 
 # =========================
 # Answer engines
@@ -195,7 +184,36 @@ def get_answer(question: str, points: int, tone: str) -> str:
     return local_template_answer(question, points, tone)
 
 # =========================
-# Main UI
+# Local auth + usage tracking
+# =========================
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+if st.session_state.user is None:
+    st.subheader("Sign in (nickname only, dev/demo mode)")
+    username = st.text_input("Pick a nickname:", placeholder="e.g., mattj")
+    if st.button("Sign in"):
+        if username.strip():
+            st.session_state.user = {"name": username.strip(), "id": uhash(username)}
+            st.success(f"Signed in as {username.strip()}")
+            st.rerun()
+    st.stop()
+
+USER = st.session_state.user
+
+db = load_usage()
+today = datetime.now().strftime("%Y-%m-%d")
+used_today = db.get(USER["id"], {}).get(today, 0)
+remaining = max(0, FREE_DAILY_LIMIT - used_today)
+
+# Sidebar
+st.sidebar.subheader("Account")
+st.sidebar.write(f"User: **{USER['name']}**")
+st.sidebar.metric("Free answers left today", remaining)
+st.sidebar.caption(f"Daily reset at midnight • Limit: {FREE_DAILY_LIMIT}")
+
+# =========================
+# Ask UI
 # =========================
 st.markdown("**Ask your homework question.** Free plan has daily limits.")
 q = st.text_area("Your question / topic", height=120, placeholder="e.g., Explain photosynthesis in simple terms")
@@ -206,7 +224,6 @@ with col1:
 with col2:
     tone = st.selectbox("Tone", ["simple", "normal", "exam-ready"])
 
-# Paywall gate for free tier
 if remaining <= 0:
     st.warning("You’ve reached your free limit for today. Come back tomorrow or upgrade to Premium.")
 else:
@@ -214,12 +231,15 @@ else:
         if not q.strip():
             st.warning("Type a question first.")
         else:
-            inc_count(db, USER["id"], today)  # consume one credit
+            # consume one credit
+            db.setdefault(USER["id"], {})
+            db[USER["id"]][today] = used_today + 1
+            save_usage(db)
             st.caption(f"Free answers left after this: {max(0, remaining-1)}")
             st.markdown(get_answer(q, max_points, tone))
 
 # =========================
-# Premium (Stripe Checkout)
+# Premium (Stripe)
 # =========================
 # tiny local "pro users" db (MVP)
 PRO_PATH = os.path.join(APP_DIR, ".pro.json")
@@ -231,7 +251,6 @@ def load_pro():
         except Exception:
             return {}
     return {}
-
 def save_pro(d):
     with open(PRO_PATH, "w") as f:
         json.dump(d, f, indent=2)
@@ -239,17 +258,18 @@ def save_pro(d):
 pro_db = load_pro()
 is_pro = USER["id"] in pro_db
 
-# handle Stripe return (if configured)
-session_id = st.query_params.get("session_id", [None])[0] if hasattr(st, "query_params") else None
+# Handle Stripe return: robust session_id parsing
+session_id = get_query_param("session_id")
 if session_id and STRIPE_AVAILABLE and STRIPE_SECRET_KEY:
     try:
         s = stripe.checkout.Session.retrieve(session_id)
-        # Treat paid/complete/subscription as success
         if (s.get("payment_status") == "paid") or (s.get("status") in ("complete",)) or (s.get("mode") == "subscription" and s.get("subscription")):
             pro_db[USER["id"]] = {"ts": time.time(), "session": session_id}
             save_pro(pro_db)
             is_pro = True
             st.success("✅ Premium unlocked!")
+        # clear params so we don't re-check on refresh
+        clear_query_params()
     except Exception as e:
         st.info(f"Stripe check error: {e}")
 
