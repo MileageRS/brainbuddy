@@ -1,10 +1,14 @@
 # brainbuddy_app.py
-import os, json, time, hashlib
+import os
+import json
+import time
+import hashlib
 from datetime import datetime
 from textwrap import dedent
 
 import requests
 import streamlit as st
+
 
 # Try to import Stripe safely so app never crashes if package isn't installed
 try:
