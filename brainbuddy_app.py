@@ -1,4 +1,4 @@
-# brainbuddy_app.py — local auth + freemium + Stripe (robust session_id parsing)
+# brainbuddy_app.py — local auth + freemium + Stripe (no query-param dependency)
 import os
 import json
 import time
@@ -9,7 +9,7 @@ from textwrap import dedent
 import requests
 import streamlit as st
 
-# Try to import Stripe safely so the app never crashes if package isn't installed
+# Safe Stripe import (app won’t crash if stripe not installed)
 try:
     import stripe
     STRIPE_AVAILABLE = True
@@ -17,92 +17,49 @@ except Exception:
     stripe = None
     STRIPE_AVAILABLE = False
 
-# =========================
-# Config / Environment
-# =========================
 APP_DIR = os.path.dirname(__file__)
 
-# Freemium usage limits (local JSON)
+# ===== Freemium limits (local JSON) =====
 USAGE_PATH = os.path.join(APP_DIR, ".usage.json")
 FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "5"))
 
-# Local (free) model via Ollama (dev only)
+# ===== Engines =====
 USE_OLLAMA = os.getenv("USE_OLLAMA", "0") == "1"
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:latest")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-
-# Optional cloud model (OpenAI or any OpenAI-compatible provider)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")  # only if you use a compatible host
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")  # optional
 
-# Stripe (Premium)
+# ===== Stripe =====
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 if STRIPE_AVAILABLE and STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
-# =========================
-# Streamlit UI setup
-# =========================
+# ===== UI =====
 st.set_page_config(page_title="🧠 BrainBuddy", page_icon="🧠", layout="centered")
 st.title("🧠 BrainBuddy — Study Copilot")
 st.caption("Free tier with daily limits. Upgrade unlocks unlimited answers + upcoming study tools.")
 st.caption("Mode: Local auth (nickname) — dev/demo only")
 
-# =========================
-# Helpers
-# =========================
+# ===== Helpers =====
 def uhash(name: str) -> str:
     return hashlib.sha256(name.strip().lower().encode("utf-8")).hexdigest()[:16]
 
-def load_usage() -> dict:
-    if os.path.exists(USAGE_PATH):
+def load_json(path, default):
+    if os.path.exists(path):
         try:
-            with open(USAGE_PATH, "r") as f:
-                return json.load(f)
+            with open(path, "r") as f: return json.load(f)
         except Exception:
-            return {}
-    return {}
+            return default
+    return default
 
-def save_usage(db: dict):
-    with open(USAGE_PATH, "w") as f:
-        json.dump(db, f, indent=2)
+def save_json(path, obj):
+    with open(path, "w") as f: json.dump(obj, f, indent=2)
 
-def get_query_param(name: str):
-    """Return a single value from Streamlit query params, handling both str and list[str]."""
-    # New API
-    try:
-        qp = st.query_params
-        if hasattr(qp, "get"):
-            val = qp.get(name)
-            if val is None:
-                return None
-            if isinstance(val, list):
-                return val[0] if val else None
-            return val
-    except Exception:
-        pass
-    # Fallback to experimental
-    try:
-        qp = st.experimental_get_query_params()
-        val = qp.get(name)
-        if isinstance(val, list):
-            return val[0] if val else None
-        return val
-    except Exception:
-        return None
-
-def clear_query_params():
-    try:
-        st.experimental_set_query_params()
-    except Exception:
-        pass
-
-# =========================
-# Answer engines
-# =========================
+# ===== Engines =====
 def local_template_answer(question: str, points: int, tone: str) -> str:
     if not question.strip():
         return "Type something first 🙂"
@@ -134,7 +91,6 @@ def local_template_answer(question: str, points: int, tone: str) -> str:
     """)
 
 def answer_with_ollama(question: str, tone: str):
-    """Calls local Ollama chat API (free local model)."""
     try:
         url = f"{OLLAMA_URL}/api/chat"
         payload = {
@@ -153,7 +109,6 @@ def answer_with_ollama(question: str, tone: str):
         return None, f"Ollama error: {e}"
 
 def answer_with_openai(question: str, tone: str):
-    """Uses OpenAI (or compatible) only if API key is set. Otherwise returns (None, reason)."""
     if not OPENAI_API_KEY:
         return None, "No OpenAI API key set."
     try:
@@ -169,23 +124,16 @@ def answer_with_openai(question: str, tone: str):
         return None, f"OpenAI error: {e}"
 
 def get_answer(question: str, points: int, tone: str) -> str:
-    # Priority: local free model → cloud model → template fallback
     if USE_OLLAMA:
         content, err = answer_with_ollama(question, tone)
-        if content:
-            return content
-        if err:
-            st.info(err)
+        if content: return content
+        if err: st.info(err)
     content, err = answer_with_openai(question, tone)
-    if content:
-        return content
-    if err:
-        st.info(err)
+    if content: return content
+    if err: st.info(err)
     return local_template_answer(question, points, tone)
 
-# =========================
-# Local auth + usage tracking
-# =========================
+# ===== Local auth + usage tracking =====
 if "user" not in st.session_state:
     st.session_state.user = None
 
@@ -200,8 +148,7 @@ if st.session_state.user is None:
     st.stop()
 
 USER = st.session_state.user
-
-db = load_usage()
+db = load_json(USAGE_PATH, {})
 today = datetime.now().strftime("%Y-%m-%d")
 used_today = db.get(USER["id"], {}).get(today, 0)
 remaining = max(0, FREE_DAILY_LIMIT - used_today)
@@ -212,12 +159,9 @@ st.sidebar.write(f"User: **{USER['name']}**")
 st.sidebar.metric("Free answers left today", remaining)
 st.sidebar.caption(f"Daily reset at midnight • Limit: {FREE_DAILY_LIMIT}")
 
-# =========================
 # Ask UI
-# =========================
 st.markdown("**Ask your homework question.** Free plan has daily limits.")
 q = st.text_area("Your question / topic", height=120, placeholder="e.g., Explain photosynthesis in simple terms")
-
 col1, col2 = st.columns(2)
 with col1:
     max_points = st.slider("Detail level", 3, 8, 5)
@@ -231,52 +175,16 @@ else:
         if not q.strip():
             st.warning("Type a question first.")
         else:
-            # consume one credit
             db.setdefault(USER["id"], {})
             db[USER["id"]][today] = used_today + 1
-            save_usage(db)
+            save_json(USAGE_PATH, db)
             st.caption(f"Free answers left after this: {max(0, remaining-1)}")
             st.markdown(get_answer(q, max_points, tone))
 
-# =========================
-# Premium (Stripe)
-# =========================
-# tiny local "pro users" db (MVP)
+# ===== Premium (Stripe) — NO query param parsing =====
 PRO_PATH = os.path.join(APP_DIR, ".pro.json")
-def load_pro():
-    if os.path.exists(PRO_PATH):
-        try:
-            with open(PRO_PATH, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-def save_pro(d):
-    with open(PRO_PATH, "w") as f:
-        json.dump(d, f, indent=2)
-
-pro_db = load_pro()
+pro_db = load_json(PRO_PATH, {})
 is_pro = USER["id"] in pro_db
-
-# Handle Stripe return: robust session_id parsing
-session_id = get_query_param("session_id")
-if session_id and STRIPE_AVAILABLE and STRIPE_SECRET_KEY:
-    try:
-        s = stripe.checkout.Session.retrieve(session_id)
-        if (s.get("payment_status") == "paid") or (s.get("status") in ("complete",)) or (s.get("mode") == "subscription" and s.get("subscription")):
-            pro_db[USER["id"]] = {"ts": time.time(), "session": session_id}
-            save_pro(pro_db)
-            is_pro = True
-            st.success("✅ Premium unlocked!")
-        # clear params so we don't re-check on refresh
-        clear_query_params()
-    except Exception as e:
-        st.info(f"Stripe check error: {e}")
-
-# Lift limits for pro users
-if is_pro:
-    FREE_DAILY_LIMIT = 10**9
-    remaining = 999999
 
 st.markdown("---")
 st.subheader("Upgrade to Premium")
@@ -284,22 +192,48 @@ st.subheader("Upgrade to Premium")
 if is_pro:
     st.success("You're on **Premium** — unlimited answers unlocked.")
 else:
-    # Only show the button if Stripe and required env vars are present
     if not (STRIPE_AVAILABLE and STRIPE_SECRET_KEY and STRIPE_PRICE_ID and PUBLIC_BASE_URL):
-        st.info("Upgrade unavailable: missing Stripe config or 'stripe' package. Ensure STRIPE_SECRET_KEY, STRIPE_PRICE_ID, PUBLIC_BASE_URL are set on the server and 'stripe' is listed in requirements.txt.")
+        st.info("Upgrade unavailable: missing Stripe config or 'stripe' package.")
     else:
-        success = f"{PUBLIC_BASE_URL}?status=success&session_id={{CHECKOUT_SESSION_ID}}"
-        cancel = f"{PUBLIC_BASE_URL}?status=cancel"
+        # Create checkout session tagged to the current local user
         if st.button("Upgrade — $5/month via Stripe"):
             try:
                 session = stripe.checkout.Session.create(
                     mode="subscription",
+                    client_reference_id=USER["id"],  # <— key change
                     line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-                    success_url=success,
-                    cancel_url=cancel,
+                    success_url=f"{PUBLIC_BASE_URL}?status=success",
+                    cancel_url=f"{PUBLIC_BASE_URL}?status=cancel",
                     ui_mode="hosted",
                 )
                 st.markdown(f"[Click to continue to Stripe Checkout]({session.url})")
                 st.stop()
             except Exception as e:
                 st.error(f"Stripe error: {e}")
+
+# When the page loads (or reloads), check Stripe for a recent completed session
+if (not is_pro) and STRIPE_AVAILABLE and STRIPE_SECRET_KEY:
+    try:
+        sessions = stripe.checkout.Session.list(limit=10)
+        # Find a recent session for this user with a completed/paid subscription
+        found = None
+        for s in sessions.data:
+            if s.get("client_reference_id") == USER["id"] and (
+                s.get("payment_status") == "paid" or
+                s.get("status") in ("complete",) or
+                (s.get("mode") == "subscription" and s.get("subscription"))
+            ):
+                found = s
+                break
+        if found:
+            pro_db[USER["id"]] = {"ts": time.time(), "session": found.get("id")}
+            save_json(PRO_PATH, pro_db)
+            is_pro = True
+            st.success("✅ Premium unlocked!")
+    except Exception as e:
+        st.info(f"Stripe check error: {e}")
+
+# If pro, lift limits (applies on next interaction)
+if is_pro:
+    FREE_DAILY_LIMIT = 10**9
+    remaining = 999999
